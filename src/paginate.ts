@@ -12,7 +12,7 @@ import {
 } from 'typeorm'
 import { WherePredicateOperator } from 'typeorm/query-builder/WhereClause'
 import { PaginateQuery } from './decorator'
-import { addFilter, FilterOperator, FilterSuffix } from './filter'
+import { addFilterWithCustomVirtual, FilterOperator, FilterSuffix } from './filter'
 import {
     checkIsEmbedded,
     checkIsRelation,
@@ -20,6 +20,7 @@ import {
     createRelationSchema,
     extractVirtualProperty,
     fixColumnAlias,
+    fixColumnAliasWithCustomVirtual,
     getMissingPrimaryKeyColumns,
     getPaddedExpr,
     getPropertiesByColumnName,
@@ -100,6 +101,8 @@ export interface PaginateConfig<T> {
     defaultJoinMethod?: JoinMethod
     joinMethods?: Partial<MappedColumns<T, JoinMethod>>
     buildCountQuery?: (qb: SelectQueryBuilder<T>) => SelectQueryBuilder<any>
+    // eslint-disable-next-line @typescript-eslint/ban-types
+    virtualColumns?: Partial<MappedColumns<T, string | ((alias: string) => string) | (string & {})>>
 }
 
 export enum PaginationLimit {
@@ -584,20 +587,49 @@ export async function paginate<T extends ObjectLiteral>(
 
             const cursorExpressions = sortBy.map(([column, direction]) => {
                 const columnProperties = getPropertiesByColumnName(column)
-                const { isVirtualProperty, query: virtualQuery } = extractVirtualProperty(
-                    queryBuilder,
-                    columnProperties
-                )
+
+                // Check for custom virtual columns first, then fall back to TypeORM virtual columns
+                const customVirtualQuery = config.virtualColumns?.[columnProperties.column]
+                let isVirtualProperty: boolean
+                let virtualQuery: any
+
+                if (customVirtualQuery) {
+                    // Custom virtual column from config
+                    isVirtualProperty = true
+                    virtualQuery = customVirtualQuery
+                } else {
+                    // Check for TypeORM @VirtualColumn
+                    const typeormVirtual = extractVirtualProperty(queryBuilder, columnProperties)
+                    isVirtualProperty = typeormVirtual.isVirtualProperty
+                    virtualQuery = typeormVirtual.query
+                }
+
                 const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
                 const isEmbedded = checkIsEmbedded(queryBuilder, columnProperties.propertyPath)
-                const alias = fixColumnAlias(
-                    columnProperties,
-                    queryBuilder.alias,
-                    isRelation,
-                    isVirtualProperty,
-                    isEmbedded,
-                    virtualQuery
-                )
+
+                let alias: string
+
+                if (customVirtualQuery) {
+                    // Use new function for custom virtual columns
+                    alias = fixColumnAliasWithCustomVirtual(
+                        columnProperties,
+                        queryBuilder.alias,
+                        isRelation,
+                        isVirtualProperty,
+                        isEmbedded,
+                        virtualQuery
+                    )
+                } else {
+                    // Use original function for TypeORM virtual columns and regular columns
+                    alias = fixColumnAlias(
+                        columnProperties,
+                        queryBuilder.alias,
+                        isRelation,
+                        isVirtualProperty,
+                        isEmbedded,
+                        virtualQuery
+                    )
+                }
 
                 // Find column metadata to determine type for proper cursor handling
                 let columnMeta = metadata.columns.find((col) => col.propertyName === columnProperties.propertyName)
@@ -658,7 +690,12 @@ export async function paginate<T extends ObjectLiteral>(
 
     let filterJoinMethods = {}
     if (query.filter) {
-        filterJoinMethods = addFilter(queryBuilder, query, config.filterableColumns)
+        filterJoinMethods = addFilterWithCustomVirtual(
+            queryBuilder,
+            query,
+            config.filterableColumns,
+            config.virtualColumns
+        )
     }
     const joinMethods = { ...filterJoinMethods, ...config.joinMethods }
 
@@ -684,13 +721,54 @@ export async function paginate<T extends ObjectLiteral>(
 
         for (const order of sortBy) {
             const columnProperties = getPropertiesByColumnName(order[0])
-            const { isVirtualProperty } = extractVirtualProperty(queryBuilder, columnProperties)
+            // Check for custom virtual columns first, then fall back to TypeORM virtual columns
+            const customVirtualQuery = config.virtualColumns?.[columnProperties.column]
+            let isVirtualProperty: boolean
+            let virtualQuery: any
+
+            if (customVirtualQuery) {
+                // Custom virtual column from config
+                isVirtualProperty = true
+                virtualQuery = customVirtualQuery
+            } else {
+                // Check for TypeORM @VirtualColumn
+                const typeormVirtual = extractVirtualProperty(queryBuilder, columnProperties)
+                isVirtualProperty = typeormVirtual.isVirtualProperty
+                virtualQuery = typeormVirtual.query
+            }
+
             const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
             const isEmbedded = checkIsEmbedded(queryBuilder, columnProperties.propertyPath)
-            let alias = fixColumnAlias(columnProperties, queryBuilder.alias, isRelation, isVirtualProperty, isEmbedded)
+
+            let alias: string
+
+            if (customVirtualQuery) {
+                // Use new function for custom virtual columns
+                alias = fixColumnAliasWithCustomVirtual(
+                    columnProperties,
+                    queryBuilder.alias,
+                    isRelation,
+                    isVirtualProperty,
+                    isEmbedded,
+                    virtualQuery
+                )
+            } else {
+                // Use original function for TypeORM virtual columns and regular columns
+                alias = fixColumnAlias(
+                    columnProperties,
+                    queryBuilder.alias,
+                    isRelation,
+                    isVirtualProperty,
+                    isEmbedded,
+                    virtualQuery
+                )
+            }
 
             if (isVirtualProperty) {
-                alias = quoteVirtualColumn(alias, isMySqlOrMariaDb)
+                // Don't quote complex expressions that already start with parentheses
+                if (!alias.startsWith('(')) {
+                    alias = quoteVirtualColumn(alias, isMySqlOrMariaDb)
+                }
             }
 
             if (isMySqlOrMariaDb) {
@@ -839,17 +917,49 @@ export async function paginate<T extends ObjectLiteral>(
                     // Strict search mode (default behavior)
                     for (const column of searchBy) {
                         const property = getPropertiesByColumnName(column)
-                        const { isVirtualProperty, query: virtualQuery } = extractVirtualProperty(qb, property)
+
+                        // Check for custom virtual columns first, then fall back to TypeORM virtual columns
+                        const customVirtualQuery = config.virtualColumns?.[property.column]
+                        let isVirtualProperty: boolean
+                        let virtualQuery: any
+
+                        if (customVirtualQuery) {
+                            // Custom virtual column from config
+                            isVirtualProperty = true
+                            virtualQuery = customVirtualQuery
+                        } else {
+                            // Check for TypeORM @VirtualColumn
+                            const typeormVirtual = extractVirtualProperty(qb, property)
+                            isVirtualProperty = typeormVirtual.isVirtualProperty
+                            virtualQuery = typeormVirtual.query
+                        }
+
                         const isRelation = checkIsRelation(qb, property.propertyPath)
                         const isEmbedded = checkIsEmbedded(qb, property.propertyPath)
-                        const alias = fixColumnAlias(
-                            property,
-                            qb.alias,
-                            isRelation,
-                            isVirtualProperty,
-                            isEmbedded,
-                            virtualQuery
-                        )
+
+                        let alias: string
+
+                        if (customVirtualQuery) {
+                            // Use new function for custom virtual columns
+                            alias = fixColumnAliasWithCustomVirtual(
+                                property,
+                                qb.alias,
+                                isRelation,
+                                isVirtualProperty,
+                                isEmbedded,
+                                virtualQuery
+                            )
+                        } else {
+                            // Use original function for TypeORM virtual columns and regular columns
+                            alias = fixColumnAlias(
+                                property,
+                                qb.alias,
+                                isRelation,
+                                isVirtualProperty,
+                                isEmbedded,
+                                virtualQuery
+                            )
+                        }
 
                         const condition: WherePredicateOperator = {
                             operator: 'ilike',
@@ -872,20 +982,49 @@ export async function paginate<T extends ObjectLiteral>(
                             new Brackets((subQb: SelectQueryBuilder<T>) => {
                                 for (const column of searchBy) {
                                     const property = getPropertiesByColumnName(column)
-                                    const { isVirtualProperty, query: virtualQuery } = extractVirtualProperty(
-                                        subQb,
-                                        property
-                                    )
+
+                                    // Check for custom virtual columns first, then fall back to TypeORM virtual columns
+                                    const customVirtualQuery = config.virtualColumns?.[property.column]
+                                    let isVirtualProperty: boolean
+                                    let virtualQuery: any
+
+                                    if (customVirtualQuery) {
+                                        // Custom virtual column from config
+                                        isVirtualProperty = true
+                                        virtualQuery = customVirtualQuery
+                                    } else {
+                                        // Check for TypeORM @VirtualColumn
+                                        const typeormVirtual = extractVirtualProperty(subQb, property)
+                                        isVirtualProperty = typeormVirtual.isVirtualProperty
+                                        virtualQuery = typeormVirtual.query
+                                    }
+
                                     const isRelation = checkIsRelation(subQb, property.propertyPath)
                                     const isEmbedded = checkIsEmbedded(subQb, property.propertyPath)
-                                    const alias = fixColumnAlias(
-                                        property,
-                                        subQb.alias,
-                                        isRelation,
-                                        isVirtualProperty,
-                                        isEmbedded,
-                                        virtualQuery
-                                    )
+
+                                    let alias: string
+
+                                    if (customVirtualQuery) {
+                                        // Use new function for custom virtual columns
+                                        alias = fixColumnAliasWithCustomVirtual(
+                                            property,
+                                            subQb.alias,
+                                            isRelation,
+                                            isVirtualProperty,
+                                            isEmbedded,
+                                            virtualQuery
+                                        )
+                                    } else {
+                                        // Use original function for TypeORM virtual columns and regular columns
+                                        alias = fixColumnAlias(
+                                            property,
+                                            subQb.alias,
+                                            isRelation,
+                                            isVirtualProperty,
+                                            isEmbedded,
+                                            virtualQuery
+                                        )
+                                    }
 
                                     const condition: WherePredicateOperator = {
                                         operator: 'ilike',

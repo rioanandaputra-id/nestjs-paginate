@@ -12,14 +12,16 @@ import {
 } from 'typeorm'
 import { WherePredicateOperator } from 'typeorm/query-builder/WhereClause'
 import { PaginateQuery } from './decorator'
-import { addFilter, FilterOperator, FilterSuffix } from './filter'
+import { addFilterWithCustomVirtual, FilterOperator, FilterSuffix } from './filter'
 import {
     checkIsEmbedded,
     checkIsRelation,
     Column,
     createRelationSchema,
     extractVirtualProperty,
+    extractVirtualPropertyWithConfig,
     fixColumnAlias,
+    fixColumnAliasWithCustomVirtual,
     getMissingPrimaryKeyColumns,
     getPaddedExpr,
     getPropertiesByColumnName,
@@ -100,6 +102,8 @@ export interface PaginateConfig<T> {
     defaultJoinMethod?: JoinMethod
     joinMethods?: Partial<MappedColumns<T, JoinMethod>>
     buildCountQuery?: (qb: SelectQueryBuilder<T>) => SelectQueryBuilder<any>
+    // eslint-disable-next-line @typescript-eslint/ban-types
+    virtualColumns?: Partial<MappedColumns<T, string | ((alias: string) => string) | (string & {})>>
 }
 
 export enum PaginationLimit {
@@ -584,13 +588,14 @@ export async function paginate<T extends ObjectLiteral>(
 
             const cursorExpressions = sortBy.map(([column, direction]) => {
                 const columnProperties = getPropertiesByColumnName(column)
-                const { isVirtualProperty, query: virtualQuery } = extractVirtualProperty(
+                const { isVirtualProperty, query: virtualQuery } = extractVirtualPropertyWithConfig(
                     queryBuilder,
-                    columnProperties
+                    columnProperties,
+                    config.virtualColumns
                 )
                 const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
                 const isEmbedded = checkIsEmbedded(queryBuilder, columnProperties.propertyPath)
-                const alias = fixColumnAlias(
+                const alias = fixColumnAliasWithCustomVirtual(
                     columnProperties,
                     queryBuilder.alias,
                     isRelation,
@@ -658,7 +663,12 @@ export async function paginate<T extends ObjectLiteral>(
 
     let filterJoinMethods = {}
     if (query.filter) {
-        filterJoinMethods = addFilter(queryBuilder, query, config.filterableColumns)
+        filterJoinMethods = addFilterWithCustomVirtual(
+            queryBuilder,
+            query,
+            config.filterableColumns,
+            config.virtualColumns
+        )
     }
     const joinMethods = { ...filterJoinMethods, ...config.joinMethods }
 
@@ -684,13 +694,27 @@ export async function paginate<T extends ObjectLiteral>(
 
         for (const order of sortBy) {
             const columnProperties = getPropertiesByColumnName(order[0])
-            const { isVirtualProperty } = extractVirtualProperty(queryBuilder, columnProperties)
+            const { isVirtualProperty, query: virtualQuery } = extractVirtualPropertyWithConfig(
+                queryBuilder,
+                columnProperties,
+                config.virtualColumns
+            )
             const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
             const isEmbedded = checkIsEmbedded(queryBuilder, columnProperties.propertyPath)
-            let alias = fixColumnAlias(columnProperties, queryBuilder.alias, isRelation, isVirtualProperty, isEmbedded)
+            let alias = fixColumnAliasWithCustomVirtual(
+                columnProperties,
+                queryBuilder.alias,
+                isRelation,
+                isVirtualProperty,
+                isEmbedded,
+                virtualQuery
+            )
 
             if (isVirtualProperty) {
-                alias = quoteVirtualColumn(alias, isMySqlOrMariaDb)
+                // Don't quote complex expressions that already start with parentheses
+                if (!alias.startsWith('(')) {
+                    alias = quoteVirtualColumn(alias, isMySqlOrMariaDb)
+                }
             }
 
             if (isMySqlOrMariaDb) {
@@ -839,10 +863,14 @@ export async function paginate<T extends ObjectLiteral>(
                     // Strict search mode (default behavior)
                     for (const column of searchBy) {
                         const property = getPropertiesByColumnName(column)
-                        const { isVirtualProperty, query: virtualQuery } = extractVirtualProperty(qb, property)
+                        const { isVirtualProperty, query: virtualQuery } = extractVirtualPropertyWithConfig(
+                            qb,
+                            property,
+                            config.virtualColumns
+                        )
                         const isRelation = checkIsRelation(qb, property.propertyPath)
                         const isEmbedded = checkIsEmbedded(qb, property.propertyPath)
-                        const alias = fixColumnAlias(
+                        const alias = fixColumnAliasWithCustomVirtual(
                             property,
                             qb.alias,
                             isRelation,
@@ -872,13 +900,14 @@ export async function paginate<T extends ObjectLiteral>(
                             new Brackets((subQb: SelectQueryBuilder<T>) => {
                                 for (const column of searchBy) {
                                     const property = getPropertiesByColumnName(column)
-                                    const { isVirtualProperty, query: virtualQuery } = extractVirtualProperty(
+                                    const { isVirtualProperty, query: virtualQuery } = extractVirtualPropertyWithConfig(
                                         subQb,
-                                        property
+                                        property,
+                                        config.virtualColumns
                                     )
                                     const isRelation = checkIsRelation(subQb, property.propertyPath)
                                     const isEmbedded = checkIsEmbedded(subQb, property.propertyPath)
-                                    const alias = fixColumnAlias(
+                                    const alias = fixColumnAliasWithCustomVirtual(
                                         property,
                                         subQb.alias,
                                         isRelation,

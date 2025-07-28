@@ -25,7 +25,9 @@ import {
     checkIsNestedRelation,
     checkIsRelation,
     extractVirtualProperty,
+    extractVirtualPropertyWithConfig,
     fixColumnAlias,
+    fixColumnAliasWithCustomVirtual,
     getPropertiesByColumnName,
     isDateColumnType,
     isISODate,
@@ -199,6 +201,57 @@ export function addWhereCondition<T>(qb: SelectQueryBuilder<T>, column: string, 
     })
 }
 
+export function addWhereConditionWithCustomVirtual<T>(
+    qb: SelectQueryBuilder<T>,
+    column: string,
+    filter: ColumnFilters,
+    virtualColumns?: any
+) {
+    const columnProperties = getPropertiesByColumnName(column)
+    const { isVirtualProperty, query: virtualQuery } = extractVirtualPropertyWithConfig(
+        qb,
+        columnProperties,
+        virtualColumns
+    )
+    const isRelation = checkIsRelation(qb, columnProperties.propertyPath)
+    const isEmbedded = checkIsEmbedded(qb, columnProperties.propertyPath)
+    const isArray = checkIsArray(qb, columnProperties.propertyName)
+
+    const alias = fixColumnAliasWithCustomVirtual(
+        columnProperties,
+        qb.alias,
+        isRelation,
+        isVirtualProperty,
+        isEmbedded,
+        virtualQuery
+    )
+    filter[column].forEach((columnFilter: Filter, index: number) => {
+        const columnNamePerIteration = `${columnProperties.column}${index}`
+        const condition = generatePredicateCondition(
+            qb,
+            columnProperties.column,
+            columnFilter,
+            alias,
+            isVirtualProperty
+        )
+        const parameters = fixQueryParam(alias, columnNamePerIteration, columnFilter, condition, {
+            [columnNamePerIteration]: columnFilter.findOperator.value,
+        })
+        if (
+            isArray &&
+            condition.parameters?.length &&
+            !['not', 'isNull', 'arrayContains'].includes(condition.operator)
+        ) {
+            condition.parameters[0] = `cardinality(${condition.parameters[0]})`
+        }
+        if (columnFilter.comparator === FilterComparator.OR) {
+            qb.orWhere(qb['createWhereConditionExpression'](condition), parameters)
+        } else {
+            qb.andWhere(qb['createWhereConditionExpression'](condition), parameters)
+        }
+    })
+}
+
 export function parseFilterToken(raw?: string): FilterToken | null {
     if (raw === undefined || raw === null) {
         return null
@@ -245,6 +298,29 @@ export function parseFilterToken(raw?: string): FilterToken | null {
 function fixColumnFilterValue<T>(column: string, qb: SelectQueryBuilder<T>, isJsonb = false) {
     const columnProperties = getPropertiesByColumnName(column)
     const virtualProperty = extractVirtualProperty(qb, columnProperties)
+    const columnType = virtualProperty.type
+
+    return (value: string) => {
+        if ((isDateColumnType(columnType) || isJsonb) && isISODate(value)) {
+            return new Date(value)
+        }
+
+        if ((columnType === Number || isJsonb) && !Number.isNaN(value)) {
+            return Number(value)
+        }
+
+        return value
+    }
+}
+
+function fixColumnFilterValueWithCustomVirtual<T>(
+    column: string,
+    qb: SelectQueryBuilder<T>,
+    virtualColumns?: any,
+    isJsonb = false
+) {
+    const columnProperties = getPropertiesByColumnName(column)
+    const virtualProperty = extractVirtualPropertyWithConfig(qb, columnProperties, virtualColumns)
     const columnType = virtualProperty.type
 
     return (value: string) => {
@@ -365,6 +441,112 @@ export function parseFilter<T>(
     return filter
 }
 
+export function parseFilterWithCustomVirtual<T>(
+    query: PaginateQuery,
+    filterableColumns?: { [column: string]: (FilterOperator | FilterSuffix)[] | true },
+    qb?: SelectQueryBuilder<T>,
+    virtualColumns?: any
+): ColumnFilters {
+    const filter: ColumnFilters = {}
+    if (!filterableColumns || !query.filter) {
+        return {}
+    }
+    for (const column of Object.keys(query.filter)) {
+        if (!(column in filterableColumns)) {
+            continue
+        }
+        const allowedOperators = filterableColumns[column]
+        const input = query.filter[column]
+        const statements = !Array.isArray(input) ? [input] : input
+        for (const raw of statements) {
+            const token = parseFilterToken(raw)
+            if (!token) {
+                continue
+            }
+            if (allowedOperators === true) {
+                if (token.operator && !isOperator(token.operator)) {
+                    continue
+                }
+                if (token.suffix && !isSuffix(token.suffix)) {
+                    continue
+                }
+            } else {
+                if (
+                    token.operator &&
+                    token.operator !== FilterOperator.EQ &&
+                    !allowedOperators.includes(token.operator)
+                ) {
+                    continue
+                }
+                if (token.suffix && !allowedOperators.includes(token.suffix)) {
+                    continue
+                }
+            }
+
+            const params: (typeof filter)[0][0] = {
+                comparator: token.comparator,
+                findOperator: undefined,
+            }
+
+            const fixValue = fixColumnFilterValueWithCustomVirtual(column, qb, virtualColumns)
+
+            const columnProperties = getPropertiesByColumnName(column)
+            const isJsonb = checkIsJsonb(qb, columnProperties.column)
+
+            switch (token.operator) {
+                case FilterOperator.BTW:
+                    params.findOperator = OperatorSymbolToFunction.get(token.operator)(
+                        ...token.value.split(',').map(fixValue)
+                    )
+                    break
+                case FilterOperator.IN:
+                case FilterOperator.CONTAINS:
+                    params.findOperator = OperatorSymbolToFunction.get(token.operator)(token.value.split(','))
+                    break
+                case FilterOperator.ILIKE:
+                    params.findOperator = OperatorSymbolToFunction.get(token.operator)(`%${token.value}%`)
+                    break
+                case FilterOperator.SW:
+                    params.findOperator = OperatorSymbolToFunction.get(token.operator)(`${token.value}%`)
+                    break
+                default:
+                    params.findOperator = OperatorSymbolToFunction.get(token.operator)(fixValue(token.value))
+            }
+
+            if (isJsonb) {
+                const parts = column.split('.')
+                const dbColumnName = parts[parts.length - 2]
+                const jsonColumnName = parts[parts.length - 1]
+
+                const jsonFixValue = fixColumnFilterValueWithCustomVirtual(column, qb, virtualColumns, true)
+
+                const jsonParams = {
+                    comparator: params.comparator,
+                    findOperator: JsonContains({
+                        [jsonColumnName]: jsonFixValue(token.value),
+                        //! Below seems to not be possible from my understanding, https://github.com/typeorm/typeorm/pull/9665
+                        //! This limits the functionaltiy to $eq only for json columns, which is a bit of a shame.
+                        //! If this is fixed or changed, we can use the commented line below instead.
+                        //[jsonColumnName]: params.findOperator,
+                    }),
+                }
+
+                filter[dbColumnName] = [...(filter[column] || []), jsonParams]
+            } else {
+                filter[column] = [...(filter[column] || []), params]
+            }
+
+            if (token.suffix) {
+                const lastFilterElement = filter[column].length - 1
+                filter[column][lastFilterElement].findOperator = OperatorSymbolToFunction.get(token.suffix)(
+                    filter[column][lastFilterElement].findOperator
+                )
+            }
+        }
+    }
+    return filter
+}
+
 export function addFilter<T>(
     qb: SelectQueryBuilder<T>,
     query: PaginateQuery,
@@ -388,6 +570,49 @@ export function addFilter<T>(
         qb.andWhere(
             new Brackets((qb: SelectQueryBuilder<T>) => {
                 addWhereCondition(qb, column, filter)
+            })
+        )
+    }
+
+    // Set the join type of every relationship used in a filter to `innerJoinAndSelect`
+    // so that records without that relationships don't show up in filters on their columns.
+    return Object.fromEntries(
+        filterEntries
+            .map(([key]) => [key, getPropertiesByColumnName(key)] as const)
+            .filter(([, properties]) => properties.propertyPath)
+            .flatMap(([, properties]) => {
+                const nesting = properties.column.split('.')
+                return Array.from({ length: nesting.length - 1 }, (_, i) => nesting.slice(0, i + 1).join('.'))
+                    .filter((relation) => checkIsNestedRelation(qb, relation))
+                    .map((relation) => [relation, 'innerJoinAndSelect'] as const)
+            })
+    )
+}
+
+export function addFilterWithCustomVirtual<T>(
+    qb: SelectQueryBuilder<T>,
+    query: PaginateQuery,
+    filterableColumns?: { [column: string]: (FilterOperator | FilterSuffix)[] | true },
+    virtualColumns?: any
+): ColumnJoinMethods {
+    const filter = parseFilterWithCustomVirtual(query, filterableColumns, qb, virtualColumns)
+
+    const filterEntries = Object.entries(filter)
+    const orFilters = filterEntries.filter(([_, value]) => value[0].comparator === '$or')
+    const andFilters = filterEntries.filter(([_, value]) => value[0].comparator === '$and')
+
+    qb.andWhere(
+        new Brackets((qb: SelectQueryBuilder<T>) => {
+            for (const [column] of orFilters) {
+                addWhereConditionWithCustomVirtual(qb, column, filter, virtualColumns)
+            }
+        })
+    )
+
+    for (const [column] of andFilters) {
+        qb.andWhere(
+            new Brackets((qb: SelectQueryBuilder<T>) => {
+                addWhereConditionWithCustomVirtual(qb, column, filter, virtualColumns)
             })
         )
     }

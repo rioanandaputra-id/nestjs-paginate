@@ -144,6 +144,37 @@ export function extractVirtualProperty(
     )
 }
 
+export function extractVirtualPropertyWithConfig(
+    qb: SelectQueryBuilder<unknown>,
+    columnProperties: ColumnProperties,
+    virtualColumns?: any
+): { isVirtualProperty: boolean; query?: string | ((alias: string) => string) | undefined; type?: any } {
+    // First check for TypeORM @VirtualColumn
+    const typeormVirtual = extractVirtualProperty(qb, columnProperties)
+    if (typeormVirtual.isVirtualProperty) {
+        return {
+            isVirtualProperty: true,
+            query: typeormVirtual.query,
+            type: typeormVirtual.type,
+        }
+    }
+
+    // Then check for custom virtual columns from config
+    if (virtualColumns && columnProperties.column in virtualColumns) {
+        return {
+            isVirtualProperty: true,
+            query: virtualColumns[columnProperties.column],
+            type: undefined, // Custom virtual columns don't have TypeORM metadata
+        }
+    }
+
+    return {
+        isVirtualProperty: false,
+        query: undefined,
+        type: undefined,
+    }
+}
+
 export function includesAllPrimaryKeyColumns(qb: SelectQueryBuilder<unknown>, propertyPath: string[]): boolean {
     if (!qb || !propertyPath) {
         return false
@@ -265,6 +296,55 @@ export function fixColumnAlias(
         }
     } else if (isVirtualProperty) {
         return query ? `(${query(`${alias}`)})` : `${alias}_${properties.propertyName}`
+    } else if (isEmbedded) {
+        return `${alias}.${properties.propertyPath}.${properties.propertyName}`
+    } else {
+        return `${alias}.${properties.propertyName}`
+    }
+}
+
+export function fixColumnAliasWithCustomVirtual(
+    properties: ColumnProperties,
+    alias: string,
+    isRelation = false,
+    isVirtualProperty = false,
+    isEmbedded = false,
+    query?: string | ((alias: string) => string)
+): string {
+    if (isRelation) {
+        if (isVirtualProperty && query) {
+            const targetAlias = `${alias}_${properties.propertyPath}_rel`
+            if (typeof query === 'function') {
+                return `(${query(targetAlias)})`
+            } else {
+                return `(${query})`
+            }
+        } else if ((isVirtualProperty && !query) || properties.isNested) {
+            if (properties.propertyName.includes('.')) {
+                const propertyPath = properties.propertyName.split('.')
+                const nestedRelations = propertyPath
+                    .slice(0, -1)
+                    .map((v) => `${v}_rel`)
+                    .join('_')
+                const nestedCol = propertyPath[propertyPath.length - 1]
+
+                return `${alias}_${properties.propertyPath}_rel_${nestedRelations}.${nestedCol}`
+            } else {
+                return `${alias}_${properties.propertyPath}_rel_${properties.propertyName}`
+            }
+        } else {
+            return `${alias}_${properties.propertyPath}_rel.${properties.propertyName}`
+        }
+    } else if (isVirtualProperty) {
+        if (query) {
+            if (typeof query === 'function') {
+                return `(${query(alias)})`
+            } else {
+                return `(${query})`
+            }
+        } else {
+            return `${alias}_${properties.propertyName}`
+        }
     } else if (isEmbedded) {
         return `${alias}.${properties.propertyPath}.${properties.propertyName}`
     } else {

@@ -21,7 +21,7 @@ describe('Custom Virtual Columns', () => {
             database: ':memory:',
             dropSchema: true,
             synchronize: true,
-            logging: true, // Enable logging to see SQL queries
+            logging: false, // Disable logging
             entities: [
                 CatEntity,
                 CatToyEntity,
@@ -86,15 +86,6 @@ describe('Custom Virtual Columns', () => {
         }
 
         const result = await paginate<CatEntity>(query, catRepo, config)
-
-        console.log(
-            'Result data colors:',
-            result.data.map((cat) => cat.color)
-        )
-        console.log(
-            'Result data names:',
-            result.data.map((cat) => cat.name)
-        )
 
         expect(result.data).toHaveLength(4)
         expect(result.meta.sortBy).toEqual([['genderLabel', 'ASC']])
